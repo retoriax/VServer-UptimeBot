@@ -1,1 +1,0 @@
-{"servers": {"86.38.182.79": {"name": "1", "periodic_running": false}, "86.38.182.77": {"name": "2", "interval": 120}}}

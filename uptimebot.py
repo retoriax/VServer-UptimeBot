@@ -12,8 +12,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
 SSH_USERNAME = os.getenv("SSH_USERNAME")
 PRIVATE_KEY_PATH = os.getenv("PRIVATE_KEY_PATH")
-SETTINGS_FILE = "settings.txt"
-
+SETTINGS_FILE = "out/settings.txt"  # Default settings file path
 
 # === Settings logic (multi-server, each with name/settings, interval pro Server) ===
 def get_settings():
@@ -28,6 +27,9 @@ def get_settings():
         return settings
 
 def set_settings(settings):
+    dirpath = os.path.dirname(SETTINGS_FILE)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
     with open(SETTINGS_FILE, "w") as f:
         json.dump(settings, f)
 

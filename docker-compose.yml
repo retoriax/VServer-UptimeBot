@@ -2,14 +2,14 @@ version: '3.8'
 services:
   kblam:
     container_name: kblam
-    image: telegrambot:latest
+    image: calamaris/kblam:latest
     restart: unless-stopped
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
       - SSH_USERNAME=${SSH_USERNAME}
-      - PRIVATE_KEY_PATH=/run/secrets/id_ed25519_hiqs
+      - PRIVATE_KEY_PATH=/run/secrets/id_ed25519
     volumes:
-      - ./id_ed25519_hiqs:/run/secrets/id_ed25519_hiqs:ro
-      - ./settings.txt:/app/settings.txt
+      - ./id_ed25519:/run/secrets/id_ed25519:ro
+      - ./out:/app/out
     tty: true

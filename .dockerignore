@@ -69,3 +69,4 @@ target_ip.txt
 # System files
 .DS_Store
 Thumbs.db
+out
