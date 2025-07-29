@@ -1,0 +1,6 @@
+.env
+venv/
+settings.txt
+__pycache__/
+
+id_*

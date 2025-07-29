@@ -1,1 +1,1 @@
-{"periodic_running": false, "interval": 120, "active_ip": "86.38.182.76", "ips": {"86.38.182.76": {"container": "train"}}}
+{"servers": {"86.38.182.79": {"name": "1", "periodic_running": false}, "86.38.182.77": {"name": "2", "interval": 120}}}

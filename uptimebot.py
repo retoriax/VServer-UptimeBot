@@ -14,36 +14,56 @@ SSH_USERNAME = os.getenv("SSH_USERNAME")
 PRIVATE_KEY_PATH = os.getenv("PRIVATE_KEY_PATH")
 SETTINGS_FILE = "settings.txt"
 
-# === Settings logic (all config in settings.txt) ===
+
+# === Settings logic (multi-server, each with name/settings, interval pro Server) ===
 def get_settings():
     try:
         with open(SETTINGS_FILE, "r") as f:
-            settings = json.load(f)
+            return json.load(f)
     except Exception:
-        settings = {"periodic_running": True, "interval": 60, "ips": {}, "active_ip": None}
+        settings = {
+            "servers": {}
+        }
         set_settings(settings)
         return settings
-    # Ensure interval is present and saved if missing
-    if "interval" not in settings:
-        settings["interval"] = 60
-        set_settings(settings)
-    return settings
 
 def set_settings(settings):
     with open(SETTINGS_FILE, "w") as f:
         json.dump(settings, f)
 
-def get_ip():
-    return get_settings().get("active_ip")
-
-def set_ip(ip):
+def get_server(ip):
     s = get_settings()
-    s["active_ip"] = ip.strip()
-    if "ips" not in s:
-        s["ips"] = {}
-    if ip.strip() not in s["ips"]:
-        s["ips"][ip.strip()] = {}
+    return s.get("servers", {}).get(ip)
+
+def set_server(ip, data):
+    s = get_settings()
+    if "servers" not in s:
+        s["servers"] = {}
+    s["servers"][ip] = data
     set_settings(s)
+
+def set_server_value(ip, key, value):
+    s = get_settings()
+    if "servers" not in s:
+        s["servers"] = {}
+    if ip not in s["servers"]:
+        s["servers"][ip] = {}
+    s["servers"][ip][key] = value
+    set_settings(s)
+
+def get_server_value(ip, key, default=None):
+    s = get_settings()
+    return s.get("servers", {}).get(ip, {}).get(key, default)
+
+def get_all_servers():
+    return get_settings().get("servers", {})
+
+# Kompatibilität: Container für IP
+def get_container(ip=None):
+    return get_server_value(ip, "container")
+
+def set_container(ip, container):
+    set_server_value(ip, "container", container)
 
 def get_container(ip):
     return get_settings().get("ips", {}).get(ip, {}).get("container")
@@ -56,6 +76,7 @@ def set_container(ip, container):
         s["ips"][ip] = {}
     s["ips"][ip]["container"] = container
     set_settings(s)
+
 
 # === SSH helpers ===
 def ssh_uptime(ip):
@@ -108,39 +129,69 @@ fi
     out, err = ssh_command(ip, script)
     return out, err
 
-# === Telegram Commands ===
-async def setip(update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        ip = context.args[0]
-        set_ip(ip)
-        # Optional: Containername direkt mitgeben
-        if len(context.args) > 1:
-            container = context.args[1]
-            set_container(ip, container)
-            await update.message.reply_text(f"IP wurde gesetzt auf {ip} und Container auf {container}")
-        else:
-            await update.message.reply_text(f"IP wurde gesetzt auf {ip}. Bitte Container mit /setcontainer <name> setzen.")
-    else:
-        await update.message.reply_text("Bitte IP angeben: /setip 1.2.3.4 [container]")
 
-# /setcontainer Command
-async def setcontainer(update, context: ContextTypes.DEFAULT_TYPE):
-    ip = get_ip()
+# === /add <ip> <name> Command ===
+async def add_command(update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Bitte nutze: /add <ip> <name>")
+        return
+    ip = context.args[0].strip()
+    name = " ".join(context.args[1:]).strip()
+    servers = get_all_servers()
+    if ip in servers:
+        await update.message.reply_text(f"{ip} existiert bereits. Nutze /sc oder /remove.")
+        return
+    set_server(ip, {"name": name})
+    # Starte sofort einen eigenen Check-Task für diesen Server
+    global periodic_tasks
+    if 'periodic_tasks' not in globals():
+        periodic_tasks = {}
+    app = context.application
+    periodic_tasks[ip] = asyncio.create_task(periodic_check_server(app, ip))
+    await update.message.reply_text(f"VServer {ip} mit Name '{name}' hinzugefügt und Überwachung gestartet.")
+
+# === /remove <ip> Command ===
+async def remove_command(update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text("Bitte nutze: /remove <name>")
+        return
+    name = context.args[0].strip()
+    s = get_settings()
+    servers = s.get("servers", {})
+    ip = next((ip for ip, srv in servers.items() if srv.get('name') == name), None)
     if not ip:
-        await update.message.reply_text("Bitte zuerst eine IP setzen: /setip <ip>")
+        await update.message.reply_text(f"Kein VServer mit Name '{name}' gefunden.")
         return
-    if not context.args:
-        await update.message.reply_text("Bitte Containername angeben: /setcontainer <containername>")
+    del servers[ip]
+    s["servers"] = servers
+    set_settings(s)
+    await update.message.reply_text(f"VServer {name} ({ip}) wurde entfernt.")
+
+# /sc <name> <container>
+async def sc(update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Bitte nutze: /sc <name> <container>")
         return
-    container = context.args[0]
+    name = context.args[0].strip()
+    container = context.args[1].strip()
+    servers = get_all_servers()
+    ip = next((ip for ip, srv in servers.items() if srv.get('name') == name), None)
+    if not ip:
+        await update.message.reply_text(f"Kein VServer mit Name '{name}' gefunden.")
+        return
     set_container(ip, container)
-    await update.message.reply_text(f"Container für {ip} wurde gesetzt auf {container}")
+    await update.message.reply_text(f"Container für {name} ({ip}) wurde gesetzt auf {container}")
 
 # === /prune Command ===
 async def prune_command(update, context: ContextTypes.DEFAULT_TYPE):
-    ip = get_ip()
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text("Bitte nutze: /prune <name>")
+        return
+    name = context.args[0].strip()
+    servers = get_all_servers()
+    ip = next((ip for ip, srv in servers.items() if srv.get('name') == name), None)
     if not ip:
-        await update.message.reply_text("Bitte zuerst eine IP setzen: /setip <ip>")
+        await update.message.reply_text(f"Kein VServer mit Name '{name}' gefunden.")
         return
     try:
         out, err = prune_output_folders(ip)
@@ -152,29 +203,70 @@ async def prune_command(update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Fehler beim Pruning: {e}")
 
-async def status(update, context: ContextTypes.DEFAULT_TYPE):
-    ip = get_ip()
+# /s <name>
+async def s_command(update, context: ContextTypes.DEFAULT_TYPE):
+    servers = get_all_servers()
+    if not context.args or len(context.args) < 1:
+        if not servers:
+            await update.message.reply_text("Keine VServer eingetragen.")
+            return
+        for ip, srv in servers.items():
+            name = srv.get('name', ip)
+            try:
+                info = ssh_uptime(ip)
+                docker_ps, _ = ssh_command(ip, 'docker ps')
+                df_h, _ = ssh_command(ip, 'df -h')
+                lines = df_h.splitlines()
+                header = lines[0] if lines else ""
+                vdb = next((line for line in lines if "/dev/vdb" in line), None)
+                df_vdb = f"{header}\n{vdb}" if vdb else f"{header}\n(nicht gefunden)"
+                container = get_container(ip)
+                if container:
+                    logs, _ = ssh_command(ip, f'docker logs --tail 20 {container}')
+                    logs_html = logs.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "&#124;")
+                    logs_block = f"<b>docker logs {container} (letzte 20 Zeilen)</b>\n<pre>{logs_html}</pre>"
+                else:
+                    logs_block = "<i>Kein Container gesetzt. Mit /sc <name> setzen.</i>"
+                vdb_warn = ""
+                if vdb:
+                    try:
+                        parts = vdb.split()
+                        use_str = next((p for p in parts if p.endswith("%")), None)
+                        if use_str and int(use_str.strip("%")) > 80:
+                            vdb_warn = "<b>⚠️ WARNING: /dev/vdb Belegung über 80%! Please make space!</b>\n"
+                    except Exception:
+                        pass
+                msg = (
+                    f"<b>VServer {name} ({ip}) ist ONLINE</b>\n"
+                    f"<b>Uptime:</b> <code>{info}</code>\n\n"
+                    f"<b>docker ps</b>\n<pre>{docker_ps}</pre>\n"
+                    f"<b>df -h /dev/vdb</b>\n<pre>{df_vdb}</pre>\n"
+                    f"{vdb_warn}{logs_block}"
+                )
+            except Exception as e:
+                msg = f"VServer {name} ({ip}) ist OFFLINE! Fehler: {e}"
+            await update.message.reply_text(msg, parse_mode='HTML')
+        return
+    name = context.args[0].strip()
+    ip = next((ip for ip, srv in servers.items() if srv.get('name') == name), None)
     if not ip:
-        await update.message.reply_text("Bitte zuerst eine IP setzen: /setip <ip>")
+        await update.message.reply_text(f"Kein VServer mit Name '{name}' gefunden.")
         return
     try:
         info = ssh_uptime(ip)
         docker_ps, _ = ssh_command(ip, 'docker ps')
         df_h, _ = ssh_command(ip, 'df -h')
-        # Header + /dev/vdb Zeile anzeigen
         lines = df_h.splitlines()
         header = lines[0] if lines else ""
         vdb = next((line for line in lines if "/dev/vdb" in line), None)
         df_vdb = f"{header}\n{vdb}" if vdb else f"{header}\n(nicht gefunden)"
-        # Container-Logs
         container = get_container(ip)
         if container:
             logs, _ = ssh_command(ip, f'docker logs --tail 20 {container}')
             logs_html = logs.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "&#124;")
             logs_block = f"<b>docker logs {container} (letzte 20 Zeilen)</b>\n<pre>{logs_html}</pre>"
         else:
-            logs_block = "<i>Kein Container gesetzt. Mit /setcontainer <name> setzen.</i>"
-
+            logs_block = "<i>Kein Container gesetzt. Mit /sc <name> setzen.</i>"
         vdb_warn = ""
         if vdb:
             try:
@@ -184,36 +276,35 @@ async def status(update, context: ContextTypes.DEFAULT_TYPE):
                     vdb_warn = "<b>⚠️ WARNING: /dev/vdb Belegung über 80%! Please make space!</b>\n"
             except Exception:
                 pass
-
         msg = (
-            f"<b>VServer {ip} ist ONLINE</b>\n"
+            f"<b>VServer {name} ({ip}) ist ONLINE</b>\n"
             f"<b>Uptime:</b> <code>{info}</code>\n\n"
             f"<b>docker ps</b>\n<pre>{docker_ps}</pre>\n"
             f"<b>df -h /dev/vdb</b>\n<pre>{df_vdb}</pre>\n"
             f"{vdb_warn}{logs_block}"
         )
     except Exception as e:
-        msg = f"VServer {ip} ist OFFLINE! Fehler: {e}"
+        msg = f"VServer {name} ({ip}) ist OFFLINE! Fehler: {e}"
     await update.message.reply_text(msg, parse_mode='HTML')
-# === Telegram Commands ===
+# /logs <name> <container>
 async def logs(update, context: ContextTypes.DEFAULT_TYPE):
-    ip = get_ip()
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Bitte nutze: /logs <name> <container>")
+        return
+    name = context.args[0].strip()
+    container = context.args[1].strip()
+    servers = get_all_servers()
+    ip = next((ip for ip, srv in servers.items() if srv.get('name') == name), None)
     if not ip:
-        await update.message.reply_text("Bitte zuerst eine IP setzen: /setip <ip>")
+        await update.message.reply_text(f"Kein VServer mit Name '{name}' gefunden.")
         return
-    if not context.args:
-        await update.message.reply_text("Bitte Containername angeben: /logs <containername>")
-        return
-    container = context.args[0]
     try:
         logs, error = ssh_command(ip, f'docker logs --tail 2000 {container}')
         if error:
             msg = f"Fehler beim Abrufen der Logs: {error}"
         else:
-            # Telegram Nachrichten sind limitiert, daher ggf. kürzen
             if len(logs) > 3500:
                 logs = logs[-3500:]
-            # Escape < und > für HTML
             clean_logs = re.sub(r"\|[^|]+?\|", "", logs)
             logs_html = clean_logs.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "&#124;")
             msg = f"Logs von {container}:\n<pre>{logs_html}</pre>"
@@ -222,17 +313,22 @@ async def logs(update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Fehler: {e}")
 
 # === /output Command ===
+# /output <name>
 async def output_command(update, context: ContextTypes.DEFAULT_TYPE):
-    ip = get_ip()
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text("Bitte nutze: /output <name>")
+        return
+    name = context.args[0].strip()
+    servers = get_all_servers()
+    ip = next((ip for ip, srv in servers.items() if srv.get('name') == name), None)
     if not ip:
-        await update.message.reply_text("Bitte zuerst eine IP setzen: /setip <ip>")
+        await update.message.reply_text(f"Kein VServer mit Name '{name}' gefunden.")
         return
     try:
         out, err = ssh_command(ip, 'ls -lh /mnt/output')
         if err:
             msg = f"Fehler beim Ausführen von ls: {err}"
         else:
-            # Escape < und > für HTML
             clean_out = re.sub(r"\|[^|]+?\|", "", out)
             out_html = clean_out.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "&#124;")
             msg = f"<b>ls -lh /mnt/output</b>\n<pre>{out_html}</pre>"
@@ -240,37 +336,62 @@ async def output_command(update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Fehler: {e}")
 
+# === /list Command ===
+async def list_command(update, context: ContextTypes.DEFAULT_TYPE):
+    servers = get_all_servers()
+    if not servers:
+        await update.message.reply_text("Keine VServer eingetragen.")
+        return
+    msg = "<b>Alle VServer:</b>\n" + "\n".join([
+        f"{srv.get('name','-')} ({ip}) - Container: {srv.get('container','-')}" for ip, srv in servers.items()
+    ])
+    await update.message.reply_text(msg, parse_mode='HTML')
+
 # === /settings Command ===
+# /settings <name>
 async def settings_command(update, context: ContextTypes.DEFAULT_TYPE):
-    settings = get_settings()
-    ip = get_ip()
-    container = get_container(ip) if ip else None
+    servers = get_all_servers()
+    if not context.args or len(context.args) < 1:
+        if not servers:
+            await update.message.reply_text("Keine VServer eingetragen.")
+            return
+        msg = "<b>Alle Einstellungen:</b>\n"
+        for ip, srv in servers.items():
+            name = srv.get('name', '-')
+            container = srv.get('container', '-')
+            interval = srv.get('interval', 60)
+            periodic = srv.get('periodic_running', True)
+            msg += (
+                f"\n<b>{name} ({ip})</b>\n"
+                f"Container: {container}\n"
+                f"Intervall: {interval} Sekunden\n"
+                f"Periodische Statusmeldungen: {'aktiv' if periodic else 'pausiert'}\n"
+            )
+        await update.message.reply_text(msg, parse_mode='HTML')
+        return
+    name = context.args[0].strip()
+    ip = next((ip for ip, srv in servers.items() if srv.get('name') == name), None)
+    if not ip:
+        await update.message.reply_text(f"Kein VServer mit Name '{name}' gefunden.")
+        return
+    container = get_container(ip)
+    interval = get_server_value(ip, "interval", 60)
+    periodic = get_server_value(ip, "periodic_running", True)
     msg = (
-        f"<b>Aktuelle Einstellungen:</b>\n"
-        f"<b>IP:</b> {ip if ip else 'Nicht gesetzt'}\n"
+        f"<b>Einstellungen für {name}:</b>\n"
+        f"<b>IP:</b> {ip}\n"
         f"<b>Container:</b> {container if container else 'Nicht gesetzt'}\n"
-        f"<b>Intervall:</b> {settings.get('interval', 60)} Sekunden\n"
-        f"<b>Periodische Statusmeldungen:</b> {'aktiv' if settings.get('periodic_running', True) else 'pausiert'}"
+        f"<b>Intervall:</b> {interval} Sekunden\n"
+        f"<b>Periodische Statusmeldungen:</b> {'aktiv' if periodic else 'pausiert'}\n"
     )
     await update.message.reply_text(msg, parse_mode='HTML')
 
-# === Periodischer Check (Background Task) ===
+# === Periodische Checks pro Server ===
+periodic_tasks = {}
 
-periodic_task = None
-
-def get_settings():
-    try:
-        with open(SETTINGS_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        # Default: periodic_running True, interval or 60
-        return {"periodic_running": True, "interval": 60}
-
-def set_settings(settings):
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(settings, f)
-
-def get_periodic_running():
+def get_periodic_running(ip=None):
+    if ip:
+        return get_server_value(ip, "periodic_running", True)
     return get_settings().get("periodic_running", True)
 
 def set_periodic_running(value: bool):
@@ -278,33 +399,16 @@ def set_periodic_running(value: bool):
     s["periodic_running"] = value
     set_settings(s)
 
-def get_interval():
-    return get_settings().get("interval", 60)
+def get_server_interval(ip):
+    # Hole Intervall für Server, fallback auf global
+    return get_server_value(ip, "interval") or get_settings().get("interval", 60)
 
-def set_interval(value: int):
-    s = get_settings()
-    s["interval"] = value
-    set_settings(s)
+def set_server_interval(ip, value):
+    set_server_value(ip, "interval", value)
 
-def set_settings(settings):
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(settings, f)
-
-def get_periodic_running():
-    return get_settings().get("periodic_running", True)
-
-def set_periodic_running(value: bool):
-    s = get_settings()
-    s["periodic_running"] = value
-    set_settings(s)
-
-async def periodic_check(app):
+async def periodic_check_server(app, ip):
     while True:
-        ip = get_ip()
-        interval = get_interval()
-        if not ip:
-            await asyncio.sleep(interval)
-            continue
+        interval = get_server_interval(ip)
         try:
             info = ssh_uptime(ip)
             docker_ps, _ = ssh_command(ip, 'docker ps')
@@ -313,38 +417,35 @@ async def periodic_check(app):
             header = lines[0] if lines else ""
             vdb = next((line for line in lines if "/dev/vdb" in line), None)
             df_vdb = f"{header}\n{vdb}" if vdb else f"{header}\n(nicht gefunden)"
-
-            # Prune output folders if needed
             try:
                 prune_output_folders(ip)
             except Exception as e:
                 await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Fehler beim Pruning: {e}")
+            # Servername holen
+            servers = get_all_servers()
+            name = servers.get(ip, {}).get('name', ip)
             container = get_container(ip)
             container_running = False
             if container:
-                # Prüfe, ob der Container läuft
                 ps_out, _ = ssh_command(ip, f'docker ps --format "{{{{.Names}}}}"')
-                running_names = [name.strip() for name in ps_out.splitlines()]
+                running_names = [n.strip() for n in ps_out.splitlines()]
                 if container in running_names:
                     container_running = True
                 logs, _ = ssh_command(ip, f'docker logs --tail 20 {container}')
                 logs_html = logs.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "&#124;")
                 logs_block = f"<b>docker logs {container} (letzte 20 Zeilen)</b>\n<pre>{logs_html}</pre>"
             else:
-                logs_block = "<i>Kein Container gesetzt. Mit /setcontainer &lt;name&gt; setzen.</i>"
-
-            # Alert, wenn Container nicht läuft
+                logs_block = "<i>Kein Container gesetzt. Mit /sc &lt;name&gt; setzen.</i>"
             if container and not container_running:
                 alert_msg = (
                     f"<b>🚨 Container DOWN!</b>\n"
-                    f"<b>Container <code>{container}</code> läuft NICHT auf {ip}!</b>\n"
+                    f"<b>Container <code>{container}</code> läuft NICHT auf {name} ({ip})!</b>\n"
                     f"Bitte prüfen!"
                 )
                 await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=alert_msg, parse_mode='HTML')
-
-            if get_periodic_running():
+            if get_periodic_running(ip):
                 msg = (
-                    f"<b>VServer {ip} ist ONLINE</b>\n"
+                    f"<b>VServer {name} ({ip}) ist ONLINE</b>\n"
                     f"<b>Uptime:</b> <code>{info}</code>\n\n"
                     f"<b>docker ps</b>\n<pre>{docker_ps}</pre>\n"
                     f"<b>df -h /dev/vdb</b>\n<pre>{df_vdb}</pre>\n"
@@ -352,9 +453,12 @@ async def periodic_check(app):
                 )
                 await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
         except Exception as e:
+            # Servername holen
+            servers = get_all_servers()
+            name = servers.get(ip, {}).get('name', ip)
             msg = (
                 "<b>🚨🚨🚨 SERVER OFFLINE! 🚨🚨🚨</b>\n"
-                f"<b>VServer {ip} ist OFFLINE!</b>\n"
+                f"<b>VServer {name} ({ip}) ist OFFLINE!</b>\n"
                 f"<b>Fehler:</b> <code>{e}</code>\n"
                 "<b>BITTE SOFORT PRÜFEN!</b>"
             )
@@ -364,41 +468,76 @@ async def periodic_check(app):
 # === /help Command ===
 
 async def interval_command(update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Bitte gib das Intervall in Sekunden an: /interval <sekunden>")
+    if not context.args or len(context.args) < 2 or not context.args[1].isdigit():
+        await update.message.reply_text("Bitte nutze: /interval <name> <sekunden>")
         return
-    seconds = int(context.args[0])
+    name = context.args[0].strip()
+    seconds = int(context.args[1])
     if seconds < 10:
         await update.message.reply_text("Das Intervall muss mindestens 10 Sekunden betragen.")
         return
-    set_interval(seconds)
-    await update.message.reply_text(f"Intervall wurde auf {seconds} Sekunden gesetzt.")
+    servers = get_all_servers()
+    ip = next((ip for ip, srv in servers.items() if srv.get('name') == name), None)
+    if not ip:
+        await update.message.reply_text(f"Kein VServer mit Name '{name}' gefunden.")
+        return
+    set_server_interval(ip, seconds)
+    await update.message.reply_text(f"Intervall für {name} wurde auf {seconds} Sekunden gesetzt.")
 
 async def help_command(update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "/help - Diese Hilfe\n"
-        "/setip <ip> [container] - Setze die Ziel-IP (und optional Container)\n"
-        "/setcontainer <container> - Setze den Container für die aktuelle IP\n"
-        "/status - Zeige Status, docker ps, df -h, docker logs\n"
-        "/logs <container> - Zeige letzte 50 Zeilen Docker Logs\n"
-        "/output - Zeige ls -lh /mnt/output\n"
-        "/stop - Pausiere periodische Statusmeldungen (Warnung bei OFFLINE kommt trotzdem)\n"
-        "/resume - Setze periodische Statusmeldungen fort\n"
-        "/interval <sekunden> - Setze das Intervall für die Statusprüfung\n"
-        "/settings - Zeige aktuelle Einstellungen"
-        "/prune - Prune output folders wenn /dev/vdb < 20G frei\n"
+        "<b>🛠️ VServer UptimeBot Hilfe</b>\n\n"
+        "<b>🔹 Allgemein</b>\n"
+        "/help – Zeigt diese Hilfe\n"
+        "/list – Zeigt alle eingetragenen Server\n\n"
+        "<b>➕ Serververwaltung</b>\n"
+        "/add &lt;ip&gt; &lt;name&gt; – Server hinzufügen und Überwachung starten\n"
+        "/remove &lt;ip&gt; – Server entfernen (nach IP)\n\n"
+        "<b>⚙️ Einstellungen</b>\n"
+        "/settings – Zeigt Einstellungen aller Server\n"
+        "/settings &lt;name&gt; – Zeigt Einstellungen für einen Server\n"
+        "/interval &lt;name&gt; &lt;sekunden&gt; – Setzt das Prüfintervall für einen Server\n\n"
+        "<b>📦 Container</b>\n"
+        "/sc &lt;name&gt; &lt;container&gt; – Setzt den Container für einen Server\n"
+        "/logs &lt;name&gt; &lt;container&gt; – Zeigt die letzten 2000 Zeilen Docker-Logs\n"
+        "/output &lt;name&gt; – Zeigt <code>ls -lh /mnt/output</code> für den Server\n\n"
+        "<b>🔄 Status & Wartung</b>\n"
+        "/s &lt;name&gt; – Zeigt Status, Uptime, Container-Logs und Speicherplatz\n"
+        "/prune &lt;name&gt; – Prune output folders, wenn /dev/vdb &lt; 20G frei\n\n"
+        "<b>⏸️/▶️ Benachrichtigungen</b>\n"
+        "/stop &lt;name&gt; – Pausiert periodische Statusmeldungen für einen Server\n"
+        "/resume &lt;name&gt; – Setzt periodische Statusmeldungen für einen Server fort\n\n"
+        "<i>Alle Kommandos sind serverbasiert. Namen und Container müssen exakt wie eingetragen angegeben werden.</i>"
     )
-    await update.message.reply_text(msg)
+    await update.message.reply_text(msg, parse_mode='HTML')
 
 # === /stop Command ===
 async def stop_command(update, context: ContextTypes.DEFAULT_TYPE):
-    set_periodic_running(False)
-    await update.message.reply_text("Periodische Statusmeldungen gestoppt.")
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text("Bitte nutze: /stop <name>")
+        return
+    name = context.args[0].strip()
+    servers = get_all_servers()
+    ip = next((ip for ip, srv in servers.items() if srv.get('name') == name), None)
+    if not ip:
+        await update.message.reply_text(f"Kein VServer mit Name '{name}' gefunden.")
+        return
+    set_server_value(ip, "periodic_running", False)
+    await update.message.reply_text(f"Periodische Statusmeldungen für {name} gestoppt.")
 
 # === /resume Command ===
 async def resume_command(update, context: ContextTypes.DEFAULT_TYPE):
-    set_periodic_running(True)
-    await update.message.reply_text("Periodische Statusmeldungen werden fortgesetzt.")
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text("Bitte nutze: /resume <name>")
+        return
+    name = context.args[0].strip()
+    servers = get_all_servers()
+    ip = next((ip for ip, srv in servers.items() if srv.get('name') == name), None)
+    if not ip:
+        await update.message.reply_text(f"Kein VServer mit Name '{name}' gefunden.")
+        return
+    set_server_value(ip, "periodic_running", True)
+    await update.message.reply_text(f"Periodische Statusmeldungen für {name} werden fortgesetzt.")
 
 
 # === Main für python-telegram-bot v22+ ===
@@ -416,9 +555,11 @@ except ImportError:
 async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("setip", setip))
-    app.add_handler(CommandHandler("setcontainer", setcontainer))
-    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("add", add_command))
+    app.add_handler(CommandHandler("remove", remove_command))
+    app.add_handler(CommandHandler("list", list_command))
+    app.add_handler(CommandHandler("sc", sc))
+    app.add_handler(CommandHandler("s", s_command))
     app.add_handler(CommandHandler("logs", logs))
     app.add_handler(CommandHandler("output", output_command))
     app.add_handler(CommandHandler("stop", stop_command))
@@ -426,12 +567,16 @@ async def main():
     app.add_handler(CommandHandler("interval", interval_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("prune", prune_command))
-    # Periodischen Check als Background-Task starten
-    global periodic_task
-    periodic_task = asyncio.create_task(periodic_check(app))
-    # Beim Start: User auffordern, eine IP zu setzen, falls keine gesetzt ist
-    if get_ip() is None:
-        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Bitte setze zuerst eine IP mit /setip <ip>")
+
+    # Für alle Server Tasks starten
+    global periodic_tasks
+    servers = get_all_servers()
+    if not servers:
+        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Bitte füge einen Server mit /add <ip> <name> hinzu.")
+    else:
+        for ip in servers:
+            periodic_tasks[ip] = asyncio.create_task(periodic_check_server(app, ip))
+
     await app.run_polling()
 
 if __name__ == '__main__':
